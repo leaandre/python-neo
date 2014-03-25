@@ -59,8 +59,8 @@ Supported : Read
 #   available when writing this code).
 # - Lack of knowledge of the Alphamap software and the associated data models.
 # - Lack of time (especially as the specifications are incomplete, a lot of
-#   reverse engineering and testing is required, which makes the development of
-#   this IO very painful and long).
+#   reverse engineering and testing is required, which makes the development 
+#   of this IO very painful and long).
 
 
 # needed for python 3 compatibility
@@ -68,8 +68,10 @@ from __future__ import absolute_import, division
 
 # specific imports
 import datetime
+import logging
 import os
 import struct
+
 
 # file no longer exists in Python3
 try:
@@ -83,7 +85,7 @@ import numpy as np
 import quantities as pq
 
 from neo.io.baseio import BaseIO
-from neo.core import Block, Segment, AnalogSignal
+from neo.core import Block, Segment, AnalogSignal, EventArray, SpikeTrain
 from neo.io.tools import create_many_to_one_relationship, populate_RecordingChannel
 
 class AlphaOmegaIO(BaseIO):
@@ -98,8 +100,20 @@ class AlphaOmegaIO(BaseIO):
     Usage:
         >>> from neo import io
         >>> r = io.AlphaOmegaIO( filename = 'File_AlphaOmega_1.map')
-        >>> blck = r.read_block(lazy = False, cascade = True)
+        >>> blck = r.read_block(lazy = False, cascade = True, 
+                                levelOption = 'AnalogSignal')
         >>> print blck.segments[0].analogsignals
+    
+    Attributes:
+        levelOption (string): 
+            2 option :
+                - 'AnalogSignal' : level signal are loaded in 
+                AnalogSignal neo object
+                - 'SpikeTrain' : level signal are loaded in 
+                SpikeTrain neo object
+
+    Inherits from:
+        neo.io.BaseIO
 
     """
 
@@ -108,104 +122,520 @@ class AlphaOmegaIO(BaseIO):
 
     # This class is able to directly or inderectly read the following kind of
     # objects
-    supported_objects  = [ Block, Segment , AnalogSignal]
+    supported_objects  = [Block, Segment, AnalogSignal, EventArray, SpikeTrain]
     # TODO: Add support for other objects that should be extractable from .map
-    # files (AnalogSignalArray, Event, EventArray, Epoch?, Epoch Array?,
+    # files (AnalogSignalArray, Event, Epoch?, Epoch Array?,
     # Spike?, SpikeTrain?)
 
     # This class can only return a Block
-    readable_objects   = [ Block ]
-    # TODO : create readers for different type of objects (Segment,
+    readable_objects   = [Block]
+    # TODO: create readers for different type of objects (Segment,
     # AnalogSignal,...)
 
     # This class is not able to write objects
-    writeable_objects  = [ ]
+    writeable_objects  = []
 
     # This is for GUI stuff : a definition for parameters when reading.
-    read_params        = { Block : [ ] }
+    read_params        = {Block: []}
 
     # Writing is not supported, so no GUI stuff
     write_params       = None
 
     name               = 'AlphaOmega'
-    extensions         = [ 'map' ]
+    extensions         = ['map','mpx']
+    mode               = 'file'
 
-    mode = 'file'
 
-
-    def __init__(self , filename = None) :
+    def __init__(self, filename=None):
         """
-
         Arguments:
-            filename : the .map Alpha Omega file name
+            filename (string): 
+                The Alpha Omega file name
+                Default: None.
+        Other Attributes:
+            levelOption (string): 
+                2 option :
+                    - 'AnalogSignal' : level signal are loaded in 
+                    AnalogSignal neo object
+                    - 'SpikeTrain' : level signal are loaded in 
+                    SpikeTrain neo object
 
         """
         BaseIO.__init__(self)
         self.filename = filename
+        self.levelOption = "AnalogSignal"
+        
+        # Logger part
+        self.logger = logging.getLogger('alphaomegaio')
+        self.logger.setLevel(logging.WARNING)
+        
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.WARNING)
+        
+        formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
 
     # write is not supported so I do not overload write method from BaseIO
 
-    def read_block(self,
+#==============================================================================
+#   Public setter
+#==============================================================================
+
+    def levelOption(self, levelOption): # WARNING: is not working yet
+        options = ['AnalogSignal','SpikeTrain']
+        if levelOption in options:
+            self.levelOption = levelOption
+        else:
+            self.logger.warning("Option : ",levelOption," is not available.")
+            print "Option : ",levelOption," is not available."
+
+#==============================================================================
+#   Private read data method
+#==============================================================================
+
+    def _read_analogData(self, fid, list_blocks, file_blocks):
+        """
+        Read datas present in block 5, and return a signal array
+            Data type read:
+                - Continuous Data
+                - Level Data
+            Arguments:
+                fid (file): file object, ready to read
+                list_blocks (list): list of indexes of data blocks
+                file_blocks (list): list of blocks
+            Returns:
+                signal_array (np.array): array fill with the analog signal
+
+        """
+        # Start time
+        count = self._count_samples(file_blocks[list_blocks[0]]['m_length'])
+        fid.seek(file_blocks[list_blocks[0]]['pos']+6 + count*2)
+        start_signal = struct.unpack('I', fid.read(4))[0]
+
+        # End time
+        count = self._count_samples(
+            file_blocks[list_blocks[len(list_blocks)-1]]['m_length'])
+        fid.seek(file_blocks[list_blocks[len(list_blocks)-1]]['pos']+
+                 6 + count*2)
+        end_signal = struct.unpack('I', fid.read(4))[0] + count
+
+        # Initialize signal array
+        # NOTE: we assume that the data block are in time range, so the first
+        # block contains the start_time and with the last block, we can find
+        # the stop_time for signal.
+        chan_signal_len = end_signal - start_signal
+        signal_array = np.empty(chan_signal_len)
+        signal_array.fill(np.nan)
+        
+        for ind_block in list_blocks:
+            # Count number of samples
+            count = self._count_samples(file_blocks[ind_block]['m_length'])
+
+            # Find start of block
+            fid.seek(file_blocks[ind_block]['pos']+6 + count*2)
+            start = struct.unpack('I', fid.read(4))[0]
+
+            # Data reading
+            start_block = start - start_signal
+            end_block = start - start_signal + count
+            fid.seek(file_blocks[ind_block]['pos']+6)
+            signal_array[start_block:end_block] = np.fromfile(fid, 
+                                                    dtype = np.int16, 
+                                                    count = count)
+        return signal_array, start_signal, end_signal
+
+    def _read_digitalData(self,fid,list_blocks,file_blocks,chan_len,ind_chan,
+                          ind):
+        """
+        Read datas present in block 5, and return 2 temp_array
+            Data type read:
+                - Digital Data
+            Arguments:
+                fid (file): file object, ready to read
+                list_blocks (list): list of indexes of data blocks
+                file_blocks (list): list of blocks
+                chan_len (np.array): array of len(total data) for a channel
+                ind_chan (int): index of channel in 'chan_len' vector
+                ind (int): index in the data vector
+            Returns:
+                temp_array_up (np.array): array fill with time for UP event
+                temp_array_down (np.array): array fill with time for DOWN event
+
+        """
+        # Initialize array
+        temp_array = np.empty(chan_len[ind_chan],
+                              dtype = np.float64)
+        labels = np.empty(chan_len[ind_chan], dtype=np.int16)
+
+        for ind_block in list_blocks:
+            count = self._count_samples(
+                    file_blocks[ind_block]['m_length'])
+            # position in file for time
+            fid.seek(file_blocks[ind_block]['pos']+6)
+            temp_array[ind:ind+count] = \
+                np.fromfile(fid,
+                            dtype = np.int32,
+                            count = count)
+            # position in file for labels
+            fid.seek(file_blocks[ind_block]['pos']+6+4)
+            labels[ind:ind+count] = \
+                np.fromfile(fid,
+                            dtype = np.int16,
+                            count = count)
+            ind += count
+
+        temp_array *= pq.ms
+
+        # Separate in Up and Down temp_array
+        temp_array_up = temp_array[labels == 1]
+        temp_array_down = temp_array[labels == 0]
+
+        return temp_array_up,temp_array_down
+
+    def _read_spikeData(self,fid,list_blocks,file_blocks):
+        """
+        Read datas present in block 5, and return objects for SpikeTrain 
+        creation
+            Data type read:
+                - Level Data
+            Arguments:
+                fid (file): file object, ready to read
+                list_blocks (list): list of indexes of data blocks
+                file_blocks (list): list of blocks
+            Returns:
+                times (np.array): array fill with time (float)
+                t_start (int) : start time of data
+                t_stop (int) : stop time of data
+                waveforms (Quantity 3D) : object containing spike waveform
+
+        """
+        # Start time
+        count = self._count_samples(file_blocks[list_blocks[0]]['m_length'])
+        fid.seek(file_blocks[list_blocks[0]]['pos']+6 + count*2)
+        t_start = struct.unpack('I', fid.read(4))[0]
+
+        # End time
+        count = self._count_samples(
+            file_blocks[list_blocks[len(list_blocks)-1]]['m_length'])
+        fid.seek(file_blocks[list_blocks[len(list_blocks)-1]]['pos']+
+                 6 + count*2)
+        t_stop = struct.unpack('I', fid.read(4))[0] + count
+
+        # Initialize times and waveforms array
+        count = self._count_samples(file_blocks[list_blocks[0]]['m_length'])
+        times = np.empty(len(list_blocks))
+        times.fill(np.nan)
+        waveforms = np.empty((len(list_blocks),1,count))
+
+        for ind,ind_block in enumerate(list_blocks):
+            waveforms[ind,:,:].fill(np.nan)
+            # Count number of samples
+            count = self._count_samples(file_blocks[ind_block]['m_length'])
+            
+            # Initialize spike array
+            spike_array = np.empty(count)
+            spike_array.fill(np.nan)
+            
+            # Find start of block
+            fid.seek(file_blocks[ind_block]['pos']+6 + count*2)
+            time = struct.unpack('I', fid.read(4))[0]
+            times[ind] = time
+
+            # Data reading
+            fid.seek(file_blocks[ind_block]['pos']+6)
+            spike_array[0:count] = np.fromfile(fid,
+                                                dtype = np.int16,
+                                                count = count)
+            waveforms[ind,:,:] = spike_array
+
+        return times, t_start, t_stop, waveforms
+
+    def _read_portData(self,fid,list_blocks,file_blocks,chan_len,ind_chan,ind):
+        """
+        Read datas present in block 5, and return 2 temp_array
+            Data type read:
+                - Port Data
+            Arguments:
+                fid (file): file object, ready to read
+                list_blocks (list): list of indexes of data blocks
+                file_blocks (list): list of blocks
+                chan_len (np.array): array of len(total data) for a channel
+                ind_chan (int): index of channel in 'chan_len' vector
+                ind (int): index in the data vector
+            Returns:
+                temp_array (np.array): array fill with time (float)
+                labels (np.array): array fill with labels (int)
+
+        """
+        # Initialize time and label array
+        temp_array = np.empty(chan_len[ind_chan],dtype = np.float64)
+        labels = np.empty(chan_len[ind_chan], dtype=np.int16)
+
+        for ind_block in list_blocks:
+            count = self._count_samples(
+                    file_blocks[ind_block]['m_length'])
+            # position in file for event or labels
+            fid.seek(file_blocks[ind_block]['pos']+6)
+            labels[ind:ind+count] = \
+                np.fromfile(fid,
+                            dtype = np.int16,
+                            count = count)
+            # position in file for time of event
+            fid.seek(file_blocks[ind_block]['pos']+6+2)
+            temp_array[ind:ind+count] = \
+                np.fromfile(fid,
+                            dtype = np.int32,
+                            count = count)
+            ind += count
+
+        return temp_array,labels
+
+#==============================================================================
+#   Private annotate block method
+#==============================================================================
+
+    def _annotate_block(self,neo_object,block):
+        """
+        Annotate neo_object with data present in information block
+            Block supported:
+                - 2
+                - b
+            Arguments:
+                neo_object (neo_object): EventArray, AnalogSignal, ...
+                block (dico): dico which contains block informations
+            Returns:
+                neo_object (neo_object): neo_object with annotations
+
+        """
+        if block['m_TypeBlock'] == '2':
+            neo_object = self._annotate_block2(neo_object,block)
+        elif block['m_TypeBlock'] == 'b':
+            neo_object = self._annotate_blockb(neo_object,block)
+
+        return neo_object
+
+    def _annotate_block2(self,neo_object,block):
+        """
+        Annotate neo_object with data present in block 2
+            Arguments:
+                neo_object (neo_object): EventArray, AnalogSignal, ...
+                block (dico): dico which contains block informations
+            Returns:
+                neo_object (neo_object): neo_object with annotations
+
+        """
+        neo_object.annotate(isInput = block['m_isInput'])
+        neo_object.annotate(numColor = block['m_numColor'])
+        neo_object.annotate(channel_type = block['type_subblock'])
+
+        if block['type_subblock'] != 'digital':
+            neo_object.annotate(Amplitude = block['m_Amplitude'])
+
+        if (block['type_subblock'] == 'level' or
+            block['type_subblock'] == 'external_trigger'):
+                neo_object.annotate(nSpikeCount = block['m_nSpikeCount'])
+                neo_object.annotate(nPreTrigmSec = block['m_nPreTrigmSec'])
+                neo_object.annotate(nPostTrigmSec = block['m_nPostTrigmSec'])
+
+        if block['type_subblock'] == 'level':
+            neo_object.annotate(LevelValue = block['m_LevelValue'])
+            neo_object.annotate(TrgMode = block['m_TrgMode'])
+            neo_object.annotate(YesRMS = block['m_YesRMS'])
+            neo_object.annotate(bAutoScale = block['m_bAutoScale'])
+
+        if block['type_subblock'] == 'digital':
+            neo_object.annotate(SaveTrigger = block['m_SaveTrigger'])
+            neo_object.annotate(Duration = block['m_Duration'])
+            neo_object.annotate(PreviousStatus = block['m_PreviousStatus'])
+
+        if (block['type_subblock'] == 'external_trigger' or 
+            block['type_subblock'] == 'digital'):
+                neo_object.annotate(numChannel = block['m_numChannel'])
+
+        return neo_object
+
+    def _annotate_blockb(self,neo_object,block):
+        """
+        Annotate neo_object with data present in block b
+            Arguments:
+                neo_object (neo_object): EventArray, AnalogSignal, ...
+                block (dico): dico which contains block informations
+            Returns:
+                neo_object (neo_object): neo_object with annotations
+
+        """
+        neo_object.annotate(BoardNumber = block['m_BoardNumber'])
+        neo_object.annotate(numChannel = block['m_numChannel'])
+        neo_object.annotate(channel_name = block['m_Name'])
+        neo_object.annotate(channel_type = 'port')
+
+        return neo_object
+
+#==============================================================================
+#   Private specific method
+#==============================================================================
+
+    def _count_samples(self,m_length):
+        """
+        Count the number of signal samples available in a type 5 data block
+            Arguments:
+                m_length (int): length of block 5
+            Returns:
+                count (int): number of samples in block 5
+
+        """
+
+        # for information about type 5 data block, see [1]
+        count = int((m_length-6)/2 - 2)
+        # -6 corresponds to the header of block 5, and the -2 take into
+        # account the fact that last 2 values are not available as the 4
+        # corresponding bytes are coding the time stamp of the beginning
+        # of the block
+        return count
+
+    def _select_availableChannel(self,groups,list_available_channel):
+        """
+        Return groups containing only group and subgroup with available channel
+            Arguments:
+                groups (list): list of group (dico)
+                list_available_channel (list) : list of available channel
+            Returns:
+                groups (list): list of available group (dico)
+
+        """
+        i_group = 0 # index of group
+        i_subgroup = 0 # index of subgroup
+        i_channel = 0 # index of channel
+
+        nb_group = len(groups) # number of group
+
+        while i_group < nb_group:
+            i_subgroup = 0
+            nb_subgroup = len(groups[i_group]['subgroups']) #number of subgroup
+            while i_subgroup < nb_subgroup:
+                i_channel = 0
+                nb_channel = len(groups \
+                                    [i_group]['subgroups'] \
+                                    [i_subgroup]['channels']) #numb of channels
+                while i_channel < nb_channel:
+                    if groups \
+                            [i_group]['subgroups'] \
+                            [i_subgroup]['channels'] \
+                            [i_channel] not in list_available_channel:
+                        del groups[i_group]['subgroups'] \
+                                  [i_subgroup]['channels'] \
+                                  [i_channel]
+                        i_channel -= 1
+                        nb_channel -= 1
+                    i_channel += 1
+                if len(groups[i_group]['subgroups'] \
+                             [i_subgroup]['channels']) == 0:
+                    del groups[i_group]['subgroups'][i_subgroup]
+                    i_subgroup -= 1
+                    nb_subgroup -= 1
+                i_subgroup += 1
+            if len(groups[i_group]['subgroups']) == 0:
+                del groups[i_group]
+                i_group -= 1
+                nb_group -= 1
+            i_group += 1
+
+        return groups
+
+#==============================================================================
+#   Public read method
+#==============================================================================
+
+    def read_block(self, lazy=False, cascade=True):
                    # the 2 first keyword arguments are imposed by neo.io API
-                   lazy = False,
-                   cascade = True):
         """
         Return a Block.
+            Arguments:
+                lazy (bool): 
+                    if True, the numerical data is not loaded, only
+                    properties and metadata
+                cascade (bool): 
+                    if False, only a single object is loaded, without its 
+                    references to other objects
+            Returns:
+                blck (Block):
 
         """
 
-        def count_samples(m_length):
-            """
-            Count the number of signal samples available in a type 5 data block
-            of length m_length
-
-            """
-
-            # for information about type 5 data block, see [1]
-            count = int((m_length-6)/2-2)
-            # -6 corresponds to the header of block 5, and the -2 take into
-            # account the fact that last 2 values are not available as the 4
-            # corresponding bytes are coding the time stamp of the beginning
-            # of the block
-            return count
-
         # create the neo Block that will be returned at the end
-        blck = Block(file_origin = os.path.basename(self.filename))
+        blck = Block(file_origin=os.path.basename(self.filename))
         blck.file_origin = os.path.basename(self.filename)
 
         fid = open(self.filename, 'rb')
 
-        # NOTE: in the following, the word "block" is used in the sense used in
-        # the alpha-omega specifications (ie a data chunk in the file), rather
-        # than in the sense of the usual Block object in neo
-
-        # step 1: read the headers of all the data blocks to load the file
-        # structure
+#==============================================================================
+#       Step 1: read the headers of all the data blocks to load the file
+#       structure
+#           NOTE: in the following, the word "block" is used in the sense used 
+#           in the alpha-omega specifications (ie a data chunk in the file), 
+#           rather than in the sense of the usual Block object in neo
+#==============================================================================
 
         pos_block = 0 # position of the current block in the file
         file_blocks = [] # list of data blocks available in the file
+        list_type_block = [] # list of data blocks available in the file
 
-        if not cascade:
-            # we read only the main header
+        informations = {} # dico containing general informations
+        groups = [] # list containing groups informations
+        out_infos = ["pos", # infos not returned in informations dico
+                     "blank",
+                     "blank2", 
+                     "m_length", 
+                     "m_TypeBlock", 
+                     "m_nextBlock",
+                     "m_EraseCount",
+                     "m_Reserved", 
+                     "m_placeMainWindow",
+                     ]
+        DAP_infos = ["DAP_buffers_filling", # infos for log
+                     "RMS_value",
+                     "num_channel",
+                     "sample_count"]
+        i_group = 0 # index of group
+        i_subgroup = 0 # index of subgroup
 
-            m_length, m_TypeBlock = struct.unpack('Hcx' , fid.read(4))
+        if not cascade: # we read only the main header
+
+            m_length, m_TypeBlock = struct.unpack('Hcx', fid.read(4))
             # m_TypeBlock should be 'h', as we read the first block
-            block = HeaderReader(fid,
+            blck = HeaderReader(fid,
                                  dict_header_type.get(m_TypeBlock,
                                                       Type_Unknown)).read_f()
-            block.update({'m_length': m_length,
+            blck.update({'m_length': m_length,
                           'm_TypeBlock': m_TypeBlock,
                           'pos': pos_block})
-            file_blocks.append(block)
+            file_blocks.append(blck)
+            list_type_block.append(m_TypeBlock)
+            
+            # Recup date and time informations
+            if m_TypeBlock == 'h':
+                blck.rec_datetime = datetime.datetime(\
+                    block['m_date_year'],
+                    block['m_date_month'],
+                    block['m_date_day'],
+                    block['m_time_hour'],
+                    block['m_time_minute'],
+                    block['m_time_second'],
+                    10000 * block['m_time_hsecond'])
+                    # the 10000 is here to convert m_time_hsecond from
+                    # centisecond to microsecond
+
 
         else: # cascade == True
 
-            seg = Segment(file_origin = os.path.basename(self.filename))
+            seg = Segment(file_origin=os.path.basename(self.filename))
             seg.file_origin = os.path.basename(self.filename)
             blck.segments.append(seg)
 
             while True:
                 first_4_bytes = fid.read(4)
+
                 if len(first_4_bytes) < 4:
                     # we have reached the end of the file
                     break
@@ -218,6 +648,12 @@ class AlphaOmegaIO(BaseIO):
                 block.update({'m_length': m_length,
                               'm_TypeBlock': m_TypeBlock,
                               'pos': pos_block})
+                list_type_block.append(m_TypeBlock)
+
+
+#==============================================================================
+#               a - Read of subblock for block 2 and 7
+#==============================================================================
 
                 if m_TypeBlock == '2':
                     # The beggining of the block of type '2' is identical for
@@ -239,16 +675,23 @@ class AlphaOmegaIO(BaseIO):
                     # external trigger as I had no test files containing data
                     # of this types.
 
-                    type_subblock = 'unknown_channel_type(m_Mode=' \
-                                    + str(block['m_Mode'])+ ')'
+                    type_subblock = 'unknown_channel_type'
                     description = Type2_SubBlockUnknownChannels
                     block.update({'m_Name': 'unknown_name'})
+
                     if block['m_isAnalog'] == 0:
                         # digital channel
                         type_subblock = 'digital'
                         description = Type2_SubBlockDigitalChannels
                     elif block['m_isAnalog'] == 1:
                         # analog channel
+                        # NOTE : analog channel block have a different 
+                        # header than digital channel. Here is the reading of
+                        # the identical part for analog channel
+                        description = Type2_SubBlockAnalogChannels
+                        subblock = HeaderReader(fid, description).read_f()
+                        block.update(subblock)
+
                         if block['m_Mode'] == 1:
                             # level channel
                             type_subblock = 'level'
@@ -264,132 +707,436 @@ class AlphaOmegaIO(BaseIO):
                             description = Type2_SubBlockContinuousChannels
 
                     subblock = HeaderReader(fid, description).read_f()
-
                     block.update(subblock)
                     block.update({'type_subblock': type_subblock})
+
+                if m_TypeBlock == '7':
+                    # The beggining of the block '7' is identical, datas 
+                    # next are different according to the documentation [1].
+
+                    description = Type7_DataSubblockUnknown
+
+                    if block['FINT'] == -111:
+                        description = Type7_DataSubblockDAPBuffers
+                    elif block['FINT'] == -222:
+                        description = Type7_DataSubblockRMS
+                    elif block['FINT'] == -444:
+                        description = Type7_DataSubblockRestart
+                    elif block['FINT'] == -333:
+                        description = Type7_DataSubblockDataLoss
+                    elif block['FINT'] == -557 or block['FINT'] == -558 :
+                        description = Type7_DataSubblockStopAnalogOutput
+
+                    subblock = HeaderReader(fid, description).read_f()
+                    block.update(subblock)
+
+#==============================================================================
+#               b - Annotate and log informations
+#==============================================================================
+
+                # Recup date and time informations
+                elif m_TypeBlock == 'h':
+                    blck.rec_datetime = datetime.datetime(\
+                    block['m_date_year'],
+                    block['m_date_month'],
+                    block['m_date_day'],
+                    block['m_time_hour'],
+                    block['m_time_minute'],
+                    block['m_time_second'],
+                    10000 * block['m_time_hsecond'])
+                    # the 10000 is here to convert m_time_hsecond from
+                    # centisecond to microsecond
+
+                    seg.rec_datetime = blck.rec_datetime.replace()
+                    # I couldn't find a simple copy function for datetime,
+                    # using replace without arguments is a twisted way to make
+                    # a copy
+
+                # Recup general informations
+                if m_TypeBlock in ['h','0']:
+                    for infos in block:
+                        if (infos in out_infos or
+                            infos.startswith("m_MainWindow_") or
+                            infos.startswith("m_date_") or
+                            infos.startswith("m_time_")):
+                                pass
+                        else:
+                                informations[infos[2:]] = block[infos]
+                if block['m_TypeBlock'] == '1':
+                    for infos in block:
+                        if infos not in out_infos:
+                            informations["Board_" + str(block["m_Number"]) +
+                                         "_" + infos.strip('m_')] = block[infos]
+
+                # Recup groups informations
+                if m_TypeBlock == '3':
+                    dico_group = {'name':block['m_nameGroup'],
+                                  'number':block['m_Number'],
+                                  'Z_Order':block['m_Z_Order'],
+                                  'subgroups':[]}
+                    groups.append(dico_group)
+                    i_group += 1
+                    i_subgroup = 0
+
+                if m_TypeBlock == '4':
+                    i_subgroup += 1
+                    dico_subgroup = {'name':block['m_Name'],
+                                     'number':block['m_Number'],
+                                     'Z_Order':block['m_Z_Order'],
+                                     'TypeOverlap':block['m_TypeOverlap'],
+                                     'channels':[]}
+                    groups[i_group-1]['subgroups'].append(dico_subgroup)
+                    for info in block:
+                        if (info.startswith('m_numChannel') and
+                            block[info] != 0):
+                                groups[i_group-1]['subgroups'] \
+                                      [i_subgroup-1]['channels'] \
+                                      .append(block[info])
+
+                # Raise errors about DAP informations
+                if m_TypeBlock == '7':
+                    error = "\nBoard " + str(block['m_numBoard']) + \
+                            " - Error " + str(block['FINT'])
+                    for info in block:
+                        if info in DAP_infos:
+                            error += " - " + str(info) + " = " + \
+                                     str(block[info])
+                    if block['FINT'] == -111:
+                        error = "DAP Buffers - " + error
+                    elif block['FINT'] == -222:
+                        error = "RMS - " + error
+                    elif block['FINT'] == -444:
+                        error = "DAP Restart - " + error
+                    elif block['FINT'] == -333:
+                        error = "Data Loss " + error
+                        error += " - Loss between " + \
+                                 str(block["first_lost_sample"]) + \
+                                 " - " + \
+                                 str(block["last_lost_sample"])
+                    elif block['FINT'] == -666:
+                        error = "Start Analog Output - " + error
+                    elif block['FINT'] == -557 or block['FINT'] == -558:
+                        error = "Stop Analog Output - " + error
+
+#                    if block['FINT'] in [-333]:
+                    self.logger.info(error)
 
                 file_blocks.append(block)
                 pos_block += m_length
                 fid.seek(pos_block)
 
-            # step 2: find the available channels
+#==============================================================================
+#           Step 2: find the available channels
+#               NOTE: Block 2 contains informations for continuous,
+#               digital, level and trigger channels. Block b contains 
+#               informations for Port channels.
+#==============================================================================
+
             list_chan = [] # list containing indexes of channel blocks
+
             for ind_block, block in enumerate(file_blocks):
-                if block['m_TypeBlock'] == '2':
+                if block['m_TypeBlock'] == '2' or block['m_TypeBlock'] == 'b':
                     list_chan.append(ind_block)
 
-            # step 3: find blocks containing data for the available channels
+
+#==============================================================================
+#           Step 3: find blocks containing data for the available channels
+#==============================================================================
+
             list_data = [] # list of lists of indexes of data blocks
                            # corresponding to each channel
+            list_available_channel = [] # list of available numChannel
+
             for ind_chan, chan in enumerate(list_chan):
                 list_data.append([])
                 num_chan = file_blocks[chan]['m_numChannel']
                 for ind_block, block in enumerate(file_blocks):
                     if block['m_TypeBlock'] == '5':
+                        list_available_channel.append(block['m_numChannel'])
                         if block['m_numChannel'] == num_chan:
                             list_data[ind_chan].append(ind_block)
 
+#==============================================================================
+#           Step 4: compute the length (number of samples) of the channels
+#==============================================================================
 
-            # step 4: compute the length (number of samples) of the channels
             chan_len = np.zeros(len(list_data), dtype = np.int)
+
             for ind_chan, list_blocks in enumerate(list_data):
                 for ind_block in list_blocks:
-                    chan_len[ind_chan] += count_samples(
+                    chan_len[ind_chan] += self._count_samples(
                                           file_blocks[ind_block]['m_length'])
 
-            # step 5: find channels for which data are available
+#==============================================================================
+#           Step 5: find channels for which data are available
+#==============================================================================
+
             ind_valid_chan = np.nonzero(chan_len)[0]
 
-            # step 6: load the data
-            # TODO give the possibility to load data as AnalogSignalArrays
+#==============================================================================
+#           Step 6: load the data
+#               TODO give the possibility to load data as AnalogSignalArrays
+#==============================================================================
+
             for ind_chan in ind_valid_chan:
-                list_blocks = list_data[ind_chan]
                 ind = 0 # index in the data vector
+                list_blocks = list_data[ind_chan]
 
                 # read time stamp for the beginning of the signal
                 form = '<l' # reading format
                 ind_block = list_blocks[0]
-                count = count_samples(file_blocks[ind_block]['m_length'])
-                fid.seek(file_blocks[ind_block]['pos']+6+count*2)
+
+                count = self._count_samples(file_blocks[ind_block]['m_length'])
+                fid.seek(file_blocks[ind_block]['pos'] + 6 + count*2)
                 buf = fid.read(struct.calcsize(form))
-                val = struct.unpack(form , buf)
+                val = struct.unpack(form, buf)
                 start_index = val[0]
 
-                # WARNING: in the following blocks are read supposing taht they
-                # are all contiguous and sorted in time. I don't know if it's
-                # always the case. Maybe we should use the time stamp of each
-                # data block to choose where to put the read data in the array.
-                if not lazy:
-                    temp_array = np.empty(chan_len[ind_chan], dtype = np.int16)
-                    # NOTE: we could directly create an empty AnalogSignal and
-                    # load the data in it, but it is much faster to load data
-                    # in a temporary numpy array and create the AnalogSignals
-                    # from this temporary array
-                    for ind_block in list_blocks:
-                        count = count_samples(
-                                file_blocks[ind_block]['m_length'])
-                        fid.seek(file_blocks[ind_block]['pos']+6)
-                        temp_array[ind:ind+count] = \
-                            np.fromfile(fid, dtype = np.int16, count = count)
-                        ind += count
-
-                sampling_rate = \
-                    file_blocks[list_chan[ind_chan]]['m_SampleRate'] * pq.kHz
+                # find the signal type
+                numChannel = file_blocks[ind_block]['m_numChannel']
+                type_signal = ''
+                for block in file_blocks:
+                    if (block['m_TypeBlock'] == '2' and 
+                        block['m_numChannel'] == numChannel):
+                            type_signal = block['type_subblock']
+                    elif (block['m_TypeBlock'] == 'b' and 
+                        block['m_numChannel'] == numChannel):
+                            type_signal = 'port'
+                            
+                sampling_rate = file_blocks \
+                                [list_chan[ind_chan]]['m_SampleRate'] * pq.kHz
                 t_start = (start_index / sampling_rate).simplified
-                if lazy:
-                    ana_sig = AnalogSignal([],
-                                           sampling_rate = sampling_rate,
-                                           t_start = t_start,
-                                           name = file_blocks\
-                                               [list_chan[ind_chan]]['m_Name'],
-                                           file_origin = \
-                                               os.path.basename(self.filename),
-                                           units = pq.dimensionless)
-                    ana_sig.lazy_shape = chan_len[ind_chan]
-                else:
-                    ana_sig = AnalogSignal(temp_array,
-                                           sampling_rate = sampling_rate,
-                                           t_start = t_start,
-                                           name = file_blocks\
-                                               [list_chan[ind_chan]]['m_Name'],
-                                           file_origin = \
-                                               os.path.basename(self.filename),
-                                           units = pq.dimensionless)
 
-                ana_sig.channel_index = \
-                            file_blocks[list_chan[ind_chan]]['m_numChannel']
-                ana_sig.annotate(channel_name = \
-                            file_blocks[list_chan[ind_chan]]['m_Name'])
-                ana_sig.annotate(channel_type = \
-                            file_blocks[list_chan[ind_chan]]['type_subblock'])
-                seg.analogsignals.append(ana_sig)
+                # CONTINUOUS signal and LEVEL signal with ANALOGSIGNAL option
+                if ('continuous' in type_signal or 
+                (type_signal == 'level' and 
+                 self.levelOption == 'AnalogSignal')):
+
+                    if lazy:
+                        ana_sig = AnalogSignal([],
+                                               sampling_rate = sampling_rate,
+                                               t_start = t_start,
+                                               name = file_blocks \
+                                                   [list_chan[ind_chan]] \
+                                                   ['m_Name'],
+                                               file_origin = os.path.basename \
+                                                   (self.filename),
+                                               units = pq.dimensionless)
+                        ana_sig.lazy_shape = chan_len[ind_chan]
+
+                    else:
+                        signal_array, t_start, t_stop = self._read_analogData(fid,
+                                                             list_blocks,
+                                                             file_blocks)
+                        t_start = (t_start / sampling_rate).simplified
+                        t_stop = (t_stop / sampling_rate).simplified
+                        ana_sig = AnalogSignal(signal_array,
+                                               sampling_rate = sampling_rate,
+                                               t_start = t_start,
+                                               t_stop = t_stop,
+                                               name = file_blocks \
+                                                   [list_chan[ind_chan]] \
+                                                   ['m_Name'],
+                                               file_origin = os.path.basename \
+                                                   (self.filename),
+                                               units = pq.dimensionless)
+
+                    ana_sig.channel_index = file_blocks \
+                                [list_chan[ind_chan]]['m_numChannel']
+                                
+                    ana_sig = self._annotate_block(ana_sig,
+                                                   file_blocks[list_chan \
+                                                               [ind_chan]])
+
+                    seg.analogsignals.append(ana_sig)
+
+                # LEVEL signal with SPIKETRAIN option
+                if type_signal == 'level' and self.levelOption == 'SpikeTrain':
+
+                    if lazy:
+                        spike_train = SpikeTrain([],
+                                                 sampling_rate =  \
+                                                    sampling_rate,
+                                                 t_start = t_start,
+                                                 t_stop = t_stop,
+                                                 waveforms = waveforms,
+                                                 left_sweep = file_blocks \
+                                                    [list_chan[ind_chan]] \
+                                                    ['m_nPreTrigmSec'],
+                                                 name = file_blocks \
+                                                    [list_chan[ind_chan]] \
+                                                    ['m_Name'],
+                                                 file_origin =  \
+                                                    os.path.basename \
+                                                    (self.filename),
+                                                 units = pq.dimensionless)
+                        spike_train.lazy_shape = chan_len[ind_chan]
+
+                    else:
+                        times,t_start,t_stop,waveforms = \
+                            self._read_spikeData(fid,
+                                                 list_blocks,
+                                                 file_blocks)
+                        times /= sampling_rate
+                        times *= pq.ms
+                        t_start = (t_start / sampling_rate).simplified
+                        t_stop = (t_stop / sampling_rate).simplified
+                        
+                        spike_train = SpikeTrain(times,
+                                                 sampling_rate = \
+                                                     sampling_rate,
+                                                 t_start = t_start,
+                                                 t_stop = t_stop,
+                                                 waveforms = waveforms,
+                                                 left_sweep = file_blocks \
+                                                    [list_chan[ind_chan]] \
+                                                    ['m_nPreTrigmSec'],
+                                                 name = file_blocks \
+                                                    [list_chan[ind_chan]] \
+                                                    ['m_Name'],
+                                                 file_origin = \
+                                                    os.path.basename \
+                                                    (self.filename),
+                                                 units = pq.dimensionless)
+
+                    spike_train.channel_index = file_blocks \
+                                [list_chan[ind_chan]]['m_numChannel']
+                                
+                    spike_train = self._annotate_block(spike_train,
+                                                    file_blocks[list_chan \
+                                                               [ind_chan]])
+                    seg.spiketrains.append(spike_train)
+
+
+                # DIGITAL signal
+                elif type_signal == 'digital':
+                    if lazy:
+                        dig_sig_up = EventArray([],
+                                                labels = np.array([],
+                                                                  dtype='S'),
+                                                name = file_blocks \
+                                                        [list_chan[ind_chan]] \
+                                                        ['m_Name'] + "_Up",
+                                                file_origin =  \
+                                                        os.path.basename \
+                                                        (self.filename))
+                        dig_sig_down = EventArray([],
+                                                  labels=np.array([],
+                                                                  dtype='S'),
+                                                  name = file_blocks \
+                                                        [list_chan[ind_chan]] \
+                                                        ['m_Name'] + "_Down",
+                                                  file_origin =  \
+                                                        os.path.basename \
+                                                        (self.filename))
+
+                    else:
+                        temp_array_up,temp_array_down = self._read_digitalData\
+                                                            (fid, 
+                                                             list_blocks, 
+                                                             file_blocks,
+                                                             chan_len,
+                                                             ind_chan,
+                                                             ind)
+                        # Treatment of temp_array
+                        temp_array_up /= sampling_rate
+                        temp_array_down /= sampling_rate
+
+                        temp_array_up = temp_array_up * pq.ms
+                        temp_array_down = temp_array_down * pq.ms
+
+                        dig_sig_up = EventArray(temp_array_up,
+                                            labels=np.array([],
+                                                            dtype='S'),
+                                            name = file_blocks \
+                                                   [list_chan[ind_chan]] \
+                                                   ['m_Name'] + "_Up",
+                                            file_origin = os.path.basename \
+                                                   (self.filename))
+                        dig_sig_down = EventArray(temp_array_down,
+                                            labels=np.array([],
+                                                            dtype='S'),
+                                            name = file_blocks \
+                                                   [list_chan[ind_chan]] \
+                                                   ['m_Name'] + "_Down",
+                                            file_origin = os.path.basename \
+                                                   (self.filename))
+
+                    dig_sig_up = self._annotate_block(dig_sig_up,
+                                                      file_blocks[list_chan \
+                                                                 [ind_chan]])
+                    dig_sig_down = self._annotate_block(dig_sig_down,
+                                                        file_blocks[list_chan \
+                                                                   [ind_chan]])
+                    dig_sig_up.annotate(sampling_rate = sampling_rate)
+                    dig_sig_down.annotate(sampling_rate = sampling_rate)
+
+                    seg.eventarrays.append(dig_sig_up)
+                    seg.eventarrays.append(dig_sig_down)
+
+
+                # PORT signal
+                elif type_signal == 'port':
+
+                    if lazy:
+                        port_sig = EventArray([],
+                                              labels=np.array([],
+                                                              dtype='S'),
+                                              name = file_blocks \
+                                                  [list_chan[ind_chan]] \
+                                                  ['m_Name'],
+                                              file_origin = os.path.basename \
+                                                  (self.filename))
+
+                    else:
+                        temp_array,labels = self._read_portData(fid,
+                                                                list_blocks,
+                                                                file_blocks,
+                                                                chan_len,
+                                                                ind_chan,
+                                                                ind)
+                        # WARNING: sampling_rate is actually not present in
+                        # the block b which refer to the channel (value of 0.0)
+                        # so temp_array are put in absolut time
+#                        temp_array /= sampling_rate # Treatment of temp_array
+                        port_sig = EventArray(temp_array,
+                                              labels = labels,
+                                              name = file_blocks \
+                                                   [list_chan[ind_chan]] \
+                                                   ['m_Name'],
+                                              file_origin = os.path.basename \
+                                                   (self.filename))
+
+                    port_sig = self._annotate_block(port_sig,
+                                                    file_blocks[list_chan \
+                                                                [ind_chan]])
+                    port_sig.annotate(sampling_rate = sampling_rate)
+                    port_sig.annotate(t_start = t_start)
+                    seg.eventarrays.append(port_sig)
 
         fid.close()
 
-        if file_blocks[0]['m_TypeBlock'] == 'h': # this should always be true
-            blck.rec_datetime = datetime.datetime(\
-                file_blocks[0]['m_date_year'],
-                file_blocks[0]['m_date_month'],
-                file_blocks[0]['m_date_day'],
-                file_blocks[0]['m_time_hour'],
-                file_blocks[0]['m_time_minute'],
-                file_blocks[0]['m_time_second'],
-                10000 * file_blocks[0]['m_time_hsecond'])
-                # the 10000 is here to convert m_time_hsecond from centisecond
-                # to microsecond
-            version = file_blocks[0]['m_version']
-            blck.annotate(alphamap_version = version)
-            if cascade:
-                seg.rec_datetime = blck.rec_datetime.replace()
-                # I couldn't find a simple copy function for datetime,
-                # using replace without arguments is a twisted way to make a
-                # copy
-                seg.annotate(alphamap_version = version)
+#==============================================================================
+#       Step 7: recup informations and annotate them
+#==============================================================================
+
+        # Select group and subgroup with available data
+        groups = self._select_availableChannel(groups,list_available_channel)
+
+        # Annotations
+        blck.annotate(informations = informations)
+        blck.annotate(groups = groups)
+
+        # Specific annotations for tools (To put out after)
+        blck.annotate(list_block = list_type_block)
+        blck.annotate(file_blocks = file_blocks)
+
         if cascade:
             populate_RecordingChannel(blck, remove_from_annotation = True)
             create_many_to_one_relationship(blck)
 
         return blck
+
 
 
 
@@ -425,9 +1172,26 @@ typedef struct
     RECT16   rcNormalPosition;
 } WINDOWPLACEMENT16,*LPNONCLIENTMETRICS16;
 
+POINT16 struct
+{
+    INT16 x;
+    INT16 y;
+}
+
+RECT16 Struct
+{
+    INT16 bottom;
+    INT16 left;
+    INT16 right;
+    INT16 top;
+}
+
 """
 
-max_string_len = '32s' # maximal length of variable length strings in the file
+max_string_len = '80s'
+#max_string_len = '32s' 
+
+# maximal length of variable length strings in the file
 # WARNING: I don't know what is the real value here. According to [1] p 139
 # it seems that it could be 20. Some tests would be needed to check this.
 
@@ -438,32 +1202,46 @@ max_string_len = '32s' # maximal length of variable length strings in the file
 # length of a string can be deduced from the lentgh of the block and the number
 # of bytes already read (it seems possible, at least for certain block types).
 
-# WARNING: Some test files contains data blocks of type 'b' and they are not
-# described in the documentation.
-
 # The name of the keys in the folowing dicts are chosen to match as closely as
 # possible the names in document [1]
 
 TypeH_Header = [
     ('m_nextBlock','l'),
     ('m_version','h'),
-    ('m_time_hour', 'B'),
-    ('m_time_minute', 'B'),
-    ('m_time_second', 'B'),
-    ('m_time_hsecond', 'B'),
-    ('m_date_day', 'B'),
-    ('m_date_month', 'B'),
-    ('m_date_year', 'H'),
-    ('m_date_dayofweek', 'B'),
-    ('blank', 'x'), # one byte blank because of the 2 bytes alignement
-    ('m_MinimumTime','d'),
-    ('m_MaximumTime','d')]
+    ('m_time_hour','B'),
+    ('m_time_minute','B'),
+    ('m_time_second','B'),
+    ('m_time_hsecond','B'),
+    ('m_date_day','B'),
+    ('m_date_month','B'),
+    ('m_date_year','H'),
+    ('m_date_dayofweek','B'),
+    ('blank', 'x'), # one byte blank for 2 bytes alignement
+    ('m_minTime','d'),
+    ('m_maxTime','d'),
+    ('m_EraseCount','l'),
+    ('m_mapVersion','b'),
+    ('m_ApplicationName','10s'),
+    ('m_ResourceVersion','4s'), # WARNING: present only in version 65, 
+    ('blank2','x'),
+    ('m_Reserved','l')] # WARNING: Mpx version. Must be checked
+
 
 Type0_SetBoards = [
     ('m_nextBlock','l'),
     ('m_BoardCount','h'),
     ('m_GroupCount','h'),
-    ('m_placeMainWindow','x')] # WARNING: unknown type ('x' is wrong)
+    ('m_MainWindow_length','H'),
+    ('m_MainWindow_flags','H'),
+    ('m_MainWindow_showCmd','H'),
+    ('m_MainWindow_ptMinPosition_x','H'),
+    ('m_MainWindow_ptMinPosition_y','H'),
+    ('m_MainWindow_ptMaxPosition_x','H'),
+    ('m_MainWindow_ptMaxPosition_y','H'),
+    ('m_MainWindow_rcNormalPosition_bottom','H'),
+    ('m_MainWindow_rcNormalPosition_left','H'),
+    ('m_MainWindow_rcNormalPosition_right','H'),
+    ('m_MainWindow_rcNormalPosition_top','H')] # WARNING: order unknown
 
 Type1_Boards = [ # WARNING: needs to be checked
     ('m_nextBlock','l'),
@@ -486,12 +1264,13 @@ Type1_Boards = [ # WARNING: needs to be checked
                           # check example in 5.5.1 for the right fields
     # WARNING: check why the following part is not corrected in the C code [2]
     ('m_nSamples','h'),
-    ('m_fRMS','f'),
+    ('m_LevelFactorRMS','f'),
     ('m_ScaleFactor','f'),
     ('m_DapTime','f'),
-    ('m_nameBoard', max_string_len)]
-    #('m_DiscMaxValue','h'), # WARNING: should this exist?
-    #('m_DiscMinValue','h') # WARNING: should this exist?
+    ('m_nameBoard', '35s'),
+    ('m_DiscMaxValue','b'), # WARNING: should this exist?
+    ('m_DiscMinValue','b'), # WARNING: should this exist?
+    ('blank','x')] # WARNING : may be before m_DiscMaxValue or after.
 
 Type2_DefBlocksChannels = [
     # common parameters for all types of channels
@@ -499,12 +1278,14 @@ Type2_DefBlocksChannels = [
     ('m_isAnalog','h'),
     ('m_isInput','h'),
     ('m_numChannel','h'),
-    ('m_numColor','h'),
+    ('m_numColor','h')]
+    
+Type2_SubBlockAnalogChannels = [    
+    ('blank', '2x'), # WARNING : this is not in the specs but it seems needed
     ('m_Mode','h')]
 
 Type2_SubBlockContinuousChannels = [
     # continuous channels parameters
-    ('blank', '2x'), # WARNING: this is not in the specs but it seems needed
     ('m_Amplitude','f'),
     ('m_SampleRate','f'),
     ('m_ContBlkSize','h'),
@@ -513,7 +1294,7 @@ Type2_SubBlockContinuousChannels = [
     ('m_bAutoScale','h'),
     ('m_Name', max_string_len)]
 
-Type2_SubBlockLevelChannels = [ # WARNING: untested
+Type2_SubBlockLevelChannels = [
     # level channels parameters
     ('m_Amplitude','f'),
     ('m_SampleRate','f'),
@@ -523,7 +1304,7 @@ Type2_SubBlockLevelChannels = [ # WARNING: untested
     ('m_nPostTrigmSec','f'),
     ('m_LevelValue','h'),
     ('m_TrgMode','h'),
-    ('m_YesRms','h'),
+    ('m_YesRMS','h'),
     ('m_bAutoScale','h'),
     ('m_Name', max_string_len)]
 
@@ -540,6 +1321,7 @@ Type2_SubBlockExtTriggerChannels = [ # WARNING: untested
 
 Type2_SubBlockDigitalChannels = [
     # digital channels parameters
+    ('m_Mode','h'),
     ('m_SampleRate','f'),
     ('m_SaveTrigger','h'),
     ('m_Duration','f'),
@@ -556,11 +1338,11 @@ Type2_SubBlockUnknownChannels = [
     ('m_SampleRate','f')]
     # there are probably other fields after...
 
-Type6_DefBlockTrigger = [ # WARNING: untested
+Type6_DefBlockTrigger = [
     ('m_nextBlock','l'),
     ('m_Number','h'),
     ('m_countChannel','h'),
-    ('m_StateChannels','i'),
+    ('m_StateChannels','h'),
     ('m_numChannel1','h'),
     ('m_numChannel2','h'),
     ('m_numChannel3','h'),
@@ -569,39 +1351,51 @@ Type6_DefBlockTrigger = [ # WARNING: untested
     ('m_numChannel6','h'),
     ('m_numChannel7','h'),
     ('m_numChannel8','h'),
-    ('m_Name','c')]
+    ('m_Name',max_string_len)]
 
-Type3_DefBlockGroup = [ # WARNING: untested
+Type3_DefBlockGroup = [
     ('m_nextBlock','l'),
     ('m_Number','h'),
     ('m_Z_Order','h'),
     ('m_countSubGroups','h'),
-    ('m_placeGroupWindow','x'), # WARNING: unknown type ('x' is wrong)
+    ('m_MainWindow_length','H'),
+    ('m_MainWindow_flags','H'),
+    ('m_MainWindow_showCmd','H'),
+    ('m_MainWindow_ptMinPosition_x','H'),
+    ('m_MainWindow_ptMinPosition_y','H'),
+    ('m_MainWindow_ptMaxPosition_x','H'),
+    ('m_MainWindow_ptMaxPosition_y','H'),
+    ('m_MainWindow_rcNormalPosition_bottom','H'),
+    ('m_MainWindow_rcNormalPosition_left','H'),
+    ('m_MainWindow_rcNormalPosition_right','H'),
+    ('m_MainWindow_rcNormalPosition_top','H'), # WARNING: order unknown
     ('m_NetLoc','h'),
-    ('m_locatMax','x'), # WARNING: unknown type ('x' is wrong)
-    ('m_nameGroup','c')]
+    ('m_locatMax','4I'),
+    ('m_nameGroup', max_string_len)] # 'c' in documentation
 
-Type4_DefBlockSubgroup = [ # WARNING: untested
+Type4_DefBlockSubgroup = [
     ('m_nextBlock','l'),
     ('m_Number','h'),
     ('m_TypeOverlap','h'),
     ('m_Z_Order','h'),
     ('m_countChannel','h'),
     ('m_NetLoc','h'),
-    ('m_location','x'), # WARNING: unknown type ('x' is wrong)
+    ('m_location','4I'),
     ('m_bIsMaximized','h'),
-    ('m_numChannel1','h'),
-    ('m_numChannel2','h'),
-    ('m_numChannel3','h'),
-    ('m_numChannel4','h'),
-    ('m_numChannel5','h'),
-    ('m_numChannel6','h'),
-    ('m_numChannel7','h'),
-    ('m_numChannel8','h'),
-    ('m_Name','c')]
+    ('m_numChannel1','H'),
+    ('m_numChannel2','H'),
+    ('m_numChannel3','H'),
+    ('m_numChannel4','H'),
+    ('m_numChannel5','H'),
+    ('m_numChannel6','H'),
+    ('m_numChannel7','H'),
+    ('m_numChannel8','H'),
+    ('m_Name', max_string_len)]
 
 Type5_DataBlockOneChannel = [
-    ('m_numChannel','h')]
+    ('m_numChannel','h'),
+    ('data','Ih'),
+    ('nextblock','Hcx')]
     # WARNING: 'm_numChannel' (called 'm_Number' in 5.4.1 of [1]) is supposed
     # to be uint according to 5.4.1 but it seems to be a short in the files
     # (or should it be ushort ?)
@@ -610,14 +1404,42 @@ Type5_DataBlockOneChannel = [
 # purposes, 7 is used for real data", but looking at some real datafiles,
 # it seems that block of type 5 are also used for real data...
 
-Type7_DataBlockMultipleChannels = [ # WARNING: unfinished
-    ('m_lenHead', 'h'), # WARNING: unknown true type
+Type7_DataBlockMultipleChannels = [
+    ('m_numBoard', 'H'), # WARNING: unknown true type
     ('FINT','h')]
-    # WARNING: there should be data after...
 
-TypeP_DefBlockPeriStimHist = [ # WARNING: untested
-    ('m_Number_Chan','h'),
-    ('m_Position','x'), # WARNING: unknown type ('x' is wrong)
+Type7_DataSubblockDAPBuffers = [
+    # FINT = - 111
+    ('DAP_buffers_filling','h')]
+
+Type7_DataSubblockRMS = [ # WARNING: untested
+    # FINT = - 222
+    ('RMS_value', 'b')]
+
+Type7_DataSubblockRestart = [ # WARNING: untested
+    # FINT = - 444
+    ('num_channel', 'h')]
+
+Type7_DataSubblockDataLoss = [
+    # FINT = - 333
+    ('num_channel', 'H'),
+    ('first_lost_sample','i'),
+    ('last_lost_sample','i')]
+
+Type7_DataSubblockStartAnalogOutput = [ # WARNING: untested
+    # FINT = - 666
+    ]
+
+Type7_DataSubblockStopAnalogOutput = [ # WARNING: untested
+    # FINT = - 557 or - 558
+    ('sample_count','i')]
+
+Type7_DataSubblockUnknown = [ # WARNING: untested
+    ('value','h')]
+
+TypeP_DefBlockPeriStimHist = [ # WARNING: present in version 100
+    ('m_numChannel','h'),
+    ('m_Position','4I'),
     ('m_isStatVisible','h'),
     ('m_DurationSec','f'),
     ('m_Rows','i'),
@@ -626,40 +1448,61 @@ TypeP_DefBlockPeriStimHist = [ # WARNING: untested
     ('m_NoTrigger','h')]
 
 TypeF_DefBlockFRTachogram = [ # WARNING: untested
-    ('m_Number_Chan','h'),
-    ('m_Position','x'), # WARNING: unknown type ('x' is wrong)
+    ('m_numChannel','h'),
+    ('m_Position','4I'),
     ('m_isStatVisible','h'),
     ('m_DurationSec','f'),
     ('m_AutoManualScale','i'),
     ('m_Max','i')]
 
-TypeR_DefBlockRaster = [ # WARNING: untested
-    ('m_Number_Chan','h'),
-    ('m_Position','x'), # WARNING: unknown type ('x' is wrong)
+TypeR_DefBlockRaster = [
+    ('m_numChannel','h'),
+    ('m_Position','4I'),
     ('m_isStatVisible','h'),
     ('m_DurationSec','f'),
+    ('blank','2x'), # WARNING: position not sure
     ('m_Rows','i'),
-    ('m_NoTrigger','h')]
+    ('m_NoTrigger','h'),
+    ('nextblock','Hcx')]
 
 TypeI_DefBlockISIHist = [ # WARNING: untested
-    ('m_Number_Chan','h'),
-    ('m_Position','x'), # WARNING: unknown type ('x' is wrong)
+    ('m_numChannel','h'),
+    ('m_Position','4I'),
     ('m_isStatVisible','h'),
     ('m_DurationSec','f'),
     ('m_Bins','i'),
     ('m_TypeScale','i')]
 
 Type8_MarkerBlock = [ # WARNING: untested
-    ('m_Number_Channel','h'),
+    ('m_numChannel','h'),
     ('m_Time','l')] # WARNING: check what's the right type here.
     # It seems that the size of time_t type depends on the system typedef,
     # I put long here but I couldn't check if it is the right type
 
 Type9_ScaleBlock = [ # WARNING: untested
-    ('m_Number_Channel','h'),
+    ('m_numChannel','h'),
     ('m_Scale','f')]
 
+Typeb_DigPortDef = [
+    ('m_BoardNumber','i'),
+    ('m_numChannel','h'),
+    ('m_SampleRate','f'),
+#    ('m_PrevValue','H'),    # WARNING : seems absent in file
+    ('m_Name', max_string_len)]
+
+TypeS_DefStreamData = [ # WARNING: untested
+    ('m_nextBlock','l'),
+    ('m_Number','h'),
+    ('m_SampleRate','f'),
+    ('m_Name', max_string_len)]
+
+TypeE_StreamDataBlock = [ # WARNING: untested
+    ('m_TypeEvent','c'),
+    ('m_uTimeStamp','L'),
+    ('m_StreamData', max_string_len)]
+
 Type_Unknown = []
+
 
 dict_header_type = {
                     'h' : TypeH_Header,
@@ -676,23 +1519,29 @@ dict_header_type = {
                     'R' : TypeR_DefBlockRaster,
                     'I' : TypeI_DefBlockISIHist,
                     '8' : Type8_MarkerBlock,
-                    '9' : Type9_ScaleBlock
+                    '9' : Type9_ScaleBlock,
+                    'b' : Typeb_DigPortDef,
+                    'S' : TypeS_DefStreamData,
+                    'E' : TypeE_StreamDataBlock,
                     }
 
 
 class HeaderReader():
-    def __init__(self,fid ,description ):
+
+    def __init__(self, fid, description):
         self.fid = fid
         self.description = description
-    def read_f(self, offset =None):
-        if offset is not None :
+
+    def read_f(self, offset=None):
+        if offset is not None:
             self.fid.seek(offset)
-        d = { }
-        for key, fmt in self.description :
+        d = {}
+        for key, fmt in self.description:
             fmt = '<' + fmt # insures use of standard sizes
             buf = self.fid.read(struct.calcsize(fmt))
-            if len(buf) != struct.calcsize(fmt) : return None
-            val = list(struct.unpack(fmt , buf))
+            if len(buf) != struct.calcsize(fmt) : 
+                return None
+            val = list(struct.unpack(fmt, buf))
             for i, ival in enumerate(val):
                 if hasattr(ival, 'split'):
                     val[i] = ival.split('\x00', 1)[0]
@@ -700,5 +1549,3 @@ class HeaderReader():
                 val = val[0]
             d[key] = val
         return d
-
-
