@@ -1017,7 +1017,7 @@ class AlphaOmegaIO(BaseIO):
                     else:
                         (signal_array, t_start) = self._read_analogData(
                             fid,
-                            list_blocks,
+                            list_blocks, 
                             file_blocks)
 
                         t_start = (t_start / sampling_rate)

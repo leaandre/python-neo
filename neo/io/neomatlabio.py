@@ -496,7 +496,7 @@ class NeoMatlabIO(BaseIO):
                 for key, value in sub_item:
                     if type(value) not in available_value:
                         value = self.create_object_from_mat_struct(value)
-                    obj[key] = value
+                    obj[key] = value 
             
             # ARRAY
             if isinstance(sub_item, np.ndarray):
